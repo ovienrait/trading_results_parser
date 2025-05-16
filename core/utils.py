@@ -5,11 +5,13 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from sqlalchemy import select
 from tqdm import tqdm
 
-from core.database import Session
+from core.database import async_session
 from core.logger_setup import setup_logger
 from core.models import SpimexTradingResult
+from core.schemas import SpimexTradingResultSchema
 
 BASE_URL = 'https://spimex.com'
 RELATIVE_URL = '/markets/oil_products/trades/results/'
@@ -63,12 +65,30 @@ def input_dates() -> Tuple[date, date]:
             print('Неверный формат даты. Повторите ввод.')
 
 
+def get_last_page_number() -> int:
+    """Получает номер последней страницы с результатами торгов."""
+
+    url = f'{BASE_URL}{RELATIVE_URL}'
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, 'lxml')
+    pagination = soup.find('div', attrs={'class': 'bx-pagination-container'})
+
+    page_numbers = []
+    for li in pagination.find_all('li'):
+        span = li.find('span')
+        if span and span.text.strip().isdigit():
+            page_numbers.append(int(span.text.strip()))
+
+    return max(page_numbers)
+
+
 def parse_all_pages(
-    cutoff_start_date: date, cutoff_end_date: date, page_number: int = 1
+    cutoff_start_date: date, cutoff_end_date: date
 ) -> List[Tuple[str, date]]:
     """Парсит все страницы с результатами торгов за указанный период."""
 
     all_xls_links: List[Tuple[str, date]] = []
+    last_page_number = get_last_page_number()
 
     logger.info(
         f'Поиск записей за период с {cutoff_start_date} по {cutoff_end_date}.'
@@ -77,7 +97,7 @@ def parse_all_pages(
     with tqdm(
         desc='Парсинг страниц', unit='стр', leave=False, initial=1
     ) as pbar:
-        while True:
+        for page_number in range(1, last_page_number + 1):
             url = f'{BASE_URL}{RELATIVE_URL}?page=page-{page_number}'
             xls_links, stop_flag = get_xls_links_from_page(
                 url, cutoff_start_date, cutoff_end_date, page_number
@@ -85,7 +105,6 @@ def parse_all_pages(
 
             pbar.update(1)
             all_xls_links.extend(xls_links)
-            page_number += 1
 
             if stop_flag:
                 break
@@ -129,10 +148,10 @@ def get_xls_links_from_page(
 
 def extract_data_from_xls(
     all_xls_links: List[Tuple[str, date]]
-) -> pd.DataFrame:
-    """Извлекает данные из XLS-файлов и возвращает их в виде DataFrame."""
+) -> List[SpimexTradingResultSchema]:
+    """Извлекает данные из XLS-файлов."""
 
-    total_dataframe: List[pd.DataFrame] = []
+    results: List[SpimexTradingResultSchema] = []
     for xls_link, xls_date in tqdm(
         all_xls_links, desc='Загрузка и парсинг XLS', unit='файл'
     ):
@@ -164,131 +183,68 @@ def extract_data_from_xls(
             df = pd.DataFrame(table_rows)
             df.columns = sheet.iloc[header_index]
             df[HEADERS[7][1]] = xls_date
-            total_dataframe.append(df)
-
-        logger.info(
-            f'Файл бюллетеня от {xls_date} обработан. '
-            f'Найдено {len(table_rows)} новых записей.'
-        )
-
-    if total_dataframe:
-        all_data = pd.concat(total_dataframe, ignore_index=True)
-        all_data.columns = all_data.columns.str.strip()
-        all_data[HEADERS[6][0]] = pd.to_numeric(
-            all_data[HEADERS[6][0]], errors='coerce'
-        )
-        filtered_data = all_data[
-            all_data[HEADERS[6][0]].fillna(0).astype(int) > 0
-        ]
-        filtered_data = filtered_data.copy()
-        filtered_data[HEADERS[6][0]] = filtered_data[HEADERS[6][0]].astype(int)
-        filtered_data = filtered_data.reset_index(drop=True)
-        final_dataframe = filtered_data[
-            [
-                HEADERS[1][0],
-                HEADERS[2][0],
-                HEADERS[3][0],
-                HEADERS[4][0],
-                HEADERS[5][0],
-                HEADERS[6][0],
-                HEADERS[7][1],
+            df[HEADERS[6][0]] = pd.to_numeric(
+                df[HEADERS[6][0]], errors='coerce'
+            )
+            df_filtered = df[
+                df[HEADERS[6][0]].fillna(0).astype(int) > 0
+            ].copy()
+            df_filtered[HEADERS[6][0]] = df_filtered[HEADERS[6][0]].astype(int)
+            df_filtered = df_filtered.reset_index(drop=True)
+            df_filtered = df_filtered[
+                [
+                    HEADERS[1][0],
+                    HEADERS[2][0],
+                    HEADERS[3][0],
+                    HEADERS[4][0],
+                    HEADERS[5][0],
+                    HEADERS[6][0],
+                    HEADERS[7][1],
+                ]
             ]
-        ].rename(
-            columns={
-                HEADERS[1][0]: HEADERS[1][1],
-                HEADERS[2][0]: HEADERS[2][1],
-                HEADERS[3][0]: HEADERS[3][1],
-                HEADERS[4][0]: HEADERS[4][1],
-                HEADERS[5][0]: HEADERS[5][1],
-                HEADERS[6][0]: HEADERS[6][1],
-            }
-        )
 
-        logger.info(f'Всего записей после фильтрации: {len(final_dataframe)}')
-        return final_dataframe
-
-    return pd.DataFrame()
-
-
-def check_field_for_update(obj: object, field: str, new_value: object) -> int:
-    """Проверяет, нужно ли обновлять поле в объекте."""
-
-    if getattr(obj, field) != new_value:
-        setattr(obj, field, new_value)
-        return 1
-    return 0
-
-
-def save_data_to_db(final_dataframe: pd.DataFrame) -> None:
-    """Сохраняет данные в БД, обновляя существующие записи."""
-
-    new_records: List[SpimexTradingResult] = []
-    changed_records = 0
-
-    with Session() as session:
-        try:
-            for _, row in tqdm(
-                final_dataframe.iterrows(),
-                total=len(final_dataframe),
-                desc='Сохранение в БД',
-                unit='запись',
-            ):
-                existing = (
-                    session.query(SpimexTradingResult)
-                    .filter_by(
-                        exchange_product_id=row[HEADERS[1][1]],
-                        date=row[HEADERS[7][1]]
-                    )
-                    .first()
-                )
-
-                if existing:
-                    counter = 0
-                    counter += check_field_for_update(
-                        existing, HEADERS[2][1], row[HEADERS[2][1]]
-                    )
-                    counter += check_field_for_update(
-                        existing, HEADERS[3][1], row[HEADERS[3][1]]
-                    )
-                    counter += check_field_for_update(
-                        existing, HEADERS[4][1], int(row[HEADERS[4][1]])
-                    )
-                    counter += check_field_for_update(
-                        existing, HEADERS[5][1], int(row[HEADERS[5][1]])
-                    )
-                    counter += check_field_for_update(
-                        existing, HEADERS[6][1], int(row[HEADERS[6][1]])
-                    )
-
-                    if counter > 0:
-                        existing.updated_on = datetime.now().replace(
-                            microsecond=0
-                        )
-                        changed_records += 1
-
-                else:
-                    record = SpimexTradingResult(
-                        exchange_product_id=row[HEADERS[1][1]],
-                        exchange_product_name=row[HEADERS[2][1]],
-                        oil_id=row[HEADERS[1][1]][:4],
-                        delivery_basis_id=row[HEADERS[1][1]][4:7],
-                        delivery_basis_name=row[HEADERS[3][1]],
-                        delivery_type_id=row[HEADERS[1][1]][-1],
-                        volume=int(row[HEADERS[4][1]]),
-                        total=int(row[HEADERS[5][1]]),
-                        count=int(row[HEADERS[6][1]]),
-                        date=row[HEADERS[7][1]],
-                    )
-                    new_records.append(record)
-
-            session.add_all(new_records)
-            session.commit()
+            for record in df_filtered.to_dict(orient='records'):
+                obj = SpimexTradingResultSchema(**record)
+                results.append(obj)
 
             logger.info(
-                f'Новых записей добавлено: {len(new_records)}. '
-                f'Записей изменено: {changed_records}.'
+                f'Файл бюллетеня от {xls_date} обработан. '
+                f'Найдено записей: {len(df_filtered)}.'
             )
 
+    logger.info(f'Всего записей: {len(results)}')
+    return results
+
+
+async def save_data_to_db_async(
+    results: List[SpimexTradingResultSchema], batch_size: int = 1000
+) -> None:
+    async with async_session() as session:
+        try:
+            existing_dates = {
+                row[0] for row in (
+                    await session.execute(select(SpimexTradingResult.date))
+                ).all()
+            }
+
+            new_records = [
+                SpimexTradingResult(
+                    **record.model_dump(exclude={'created_on', 'updated_on'})
+                )
+                for record in results
+                if record.date not in existing_dates
+            ]
+
+            for i in range(0, len(new_records), batch_size):
+                batch = new_records[i:i + batch_size]
+                session.add_all(batch)
+                await session.commit()
+
+            if new_records:
+                logger.info(f'Добавлено новых записей: {len(new_records)}')
+            else:
+                logger.info('Нет новых записей для добавления.')
+
         except Exception:
-            session.rollback()
+            await session.rollback()
             logger.info('Ошибка при сохранении данных в БД.')
