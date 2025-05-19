@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from pydantic import TypeAdapter
 from sqlalchemy import select
 from tqdm import tqdm
 
@@ -152,6 +153,7 @@ def extract_data_from_xls(
     """Извлекает данные из XLS-файлов."""
 
     results: List[SpimexTradingResultSchema] = []
+    adapter = TypeAdapter(list[SpimexTradingResultSchema])
     for xls_link, xls_date in tqdm(
         all_xls_links, desc='Загрузка и парсинг XLS', unit='файл'
     ):
@@ -203,9 +205,9 @@ def extract_data_from_xls(
                 ]
             ]
 
-            for record in df_filtered.to_dict(orient='records'):
-                obj = SpimexTradingResultSchema(**record)
-                results.append(obj)
+            results.extend(adapter.validate_python(
+                df_filtered.to_dict(orient='records')
+            ))
 
             logger.info(
                 f'Файл бюллетеня от {xls_date} обработан. '
@@ -237,7 +239,9 @@ async def save_data_to_db_async(
 
             for i in range(0, len(new_records), batch_size):
                 batch = new_records[i:i + batch_size]
-                session.add_all(batch)
+                for record in batch:
+                    session.add(record)
+                await session.flush()
                 await session.commit()
 
             if new_records:
