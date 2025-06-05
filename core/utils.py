@@ -12,7 +12,7 @@ import multiprocessing
 from tqdm.asyncio import tqdm_asyncio
 from bs4 import BeautifulSoup
 from pydantic import TypeAdapter
-from sqlalchemy import select
+from sqlalchemy import select, insert
 
 from core.database import async_session
 from core.logger_setup import setup_logger
@@ -362,17 +362,14 @@ async def save_batch(
     async with semaphore:
         async with async_session() as session:
             try:
-                models = [
-                    SpimexTradingResult(
-                        **record.model_dump(
-                            exclude={'created_on', 'updated_on'})
-                    )
+                values = [
+                    record.model_dump(exclude={'created_on', 'updated_on'})
                     for record in batch
                 ]
-                session.add_all(models)
-                await session.flush()
+                stmt = insert(SpimexTradingResult).values(values)
+                await session.execute(stmt)
                 await session.commit()
-                return len(models)
+                return len(values)
 
             except Exception as e:
                 await session.rollback()

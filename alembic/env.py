@@ -3,7 +3,7 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 
 from alembic import context
-from core.config import ALEMBIC_SYNC_DB_URL
+from core.config import settings
 from core.models import Base
 
 config = context.config
@@ -11,7 +11,7 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option('sqlalchemy.url', ALEMBIC_SYNC_DB_URL)
+config.set_main_option('sqlalchemy.url', settings.ALEMBIC_SYNC_DB_URL)
 
 target_metadata = Base.metadata
 
