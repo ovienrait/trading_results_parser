@@ -17,5 +17,6 @@ class SpimexTradingResultOut(BaseModel):
     count: Optional[int]
     date: date
 
-    class Config:
-        from_attributes = True
+    model_config = {
+        'from_attributes': True
+    }

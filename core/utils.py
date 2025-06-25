@@ -13,6 +13,7 @@ from tqdm.asyncio import tqdm_asyncio
 from bs4 import BeautifulSoup
 from pydantic import TypeAdapter
 from sqlalchemy import select, insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from core.database import async_session
 from core.logger_setup import setup_logger
@@ -355,12 +356,13 @@ async def extract_data_from_xls(
 
 
 async def save_batch(
-    batch: List[SpimexTradingResultSchema], semaphore: asyncio.Semaphore
+    batch: List[SpimexTradingResultSchema], semaphore: asyncio.Semaphore,
+    session_fabric: async_sessionmaker[AsyncSession] = async_session
 ) -> int:
     """Сохраняет батч данных в базу данных асинхронно."""
 
     async with semaphore:
-        async with async_session() as session:
+        async with session_fabric() as session:
             try:
                 values = [
                     record.model_dump(exclude={'created_on', 'updated_on'})
@@ -378,12 +380,15 @@ async def save_batch(
 
 
 async def save_data_to_db_async(
-    results: List[SpimexTradingResultSchema], batch_size: int = 1000
+    results: List[SpimexTradingResultSchema], session_fabric: async_sessionmaker[AsyncSession] = async_session,
+    batch_size: int = 1000
 ) -> None:
     """Асинхронно сохраняет данные в базу данных."""
 
-    async with async_session() as session:
+    async with session_fabric() as session:
         try:
+            await session.commit()
+
             existing_dates = {
                 row[0] for row in (
                     await session.execute(select(SpimexTradingResult.date))
@@ -405,7 +410,7 @@ async def save_data_to_db_async(
     semaphore = asyncio.Semaphore(10)
 
     tasks = await asyncio.gather(*[
-        save_batch(batch, semaphore) for batch in batches
+        save_batch(batch, semaphore, session_fabric=session_fabric) for batch in batches
     ])
 
     total_saved = sum(tasks)

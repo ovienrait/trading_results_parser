@@ -1,5 +1,5 @@
 from typing import Optional
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from datetime import date
 
 
@@ -23,3 +23,5 @@ class SpimexTradingResultSchema(BaseModel):
         model.delivery_basis_id = ep_id[4:7]
         model.delivery_type_id = ep_id[-1]
         return model
+
+    model_config = ConfigDict(populate_by_name=True)
